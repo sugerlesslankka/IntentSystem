@@ -1,0 +1,12 @@
+**/__pycache__/
+wandb/
+results/
+checkpoints/
+qwen1.5/
+qingsi_data/
+PEAR-7b/
+KCDN-small/
+int_desc_dataset/
+demo/
+deepseek-7b/
+robot/
