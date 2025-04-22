@@ -1,73 +1,35 @@
-from models.loader import load_model_and_processor
-from models.utils import get_visual_type, VALID_DATA_FORMAT_STRING
+from human_model.loader import load_model_and_processor
+from human_model.utils import get_visual_type, VALID_DATA_FORMAT_STRING
 import os
 from tqdm import tqdm
 import json
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
-import pandas as pd
-import re
-import gc
-import openpyxl
-from openpyxl_image_loader import SheetImageLoader
-from openpyxl.utils import get_column_letter
-torch.backends.cudnn.enabled = False
+import cv2
+from scene_model.utils.misc import generate2_adpt_if_nodist
+from scene_model.project.models.model import MappingType, CaptionModel
+from transformers import GPT2Tokenizer
+from scene_model.clip1.clip import _transform
+from PIL import Image
+import torch.distributed as dist
+import time
+from random import sample
+from vllm import LLM, SamplingParams
 
-# 加载xls文件，包含图片列
-def process_input(file_path, sheet_name='Sheet1'):
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    
-    # 判断工作表是否存在，不存在则使用第一个工作表
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-    else:
-        ws = wb[wb.sheetnames[0]]
-    
-    # 获取表头所在行（假设第一行为表头），记录各列标题对应的列号
-    header = {}
-    for col in range(1, ws.max_column + 1):
-        cell_value = ws.cell(row=1, column=col).value
-        if cell_value is not None:
-            header[cell_value] = col
+# dist.init_process_group("nccl", init_method='file:///tmp/somefile', rank=0, world_size=1)
+# torch.backends.cudnn.enabled = False
 
-    # 检查必须的列是否存在
-    required_columns = ['缩略图', '抓拍时间', '抓拍地点']
-    for col_name in required_columns:
-        if col_name not in header:
-            raise ValueError(f"找不到必需的列: {col_name}")
-    
-    # 获取各列的列号
-    img_col = header['缩略图']
-    time_col = header['抓拍时间']
-    trace_col = header['抓拍地点']
-    
-    # 创建图片加载器，用于提取单元格中的图片
-    image_loader = SheetImageLoader(ws)
-    image_column = []
-    time_column = []
-    trace_column = []
-    
-    # 从第二行开始（跳过表头），并按照逆序处理（即列表中第一项为最后一行数据）
-    for row in range(ws.max_row, 1, -1):
-        # 生成“缩略图”所在单元格的坐标
-        cell_coord = get_column_letter(img_col) + str(row)
-        if image_loader.image_in(cell_coord):
-            img = image_loader.get(cell_coord)
-        else:
-            img = None
-        image_column.append(img)
-        
-        # 读取“抓拍时间”与“抓拍地点”对应单元格的值
-        time_val = ws.cell(row=row, column=time_col).value
-        trace_val = ws.cell(row=row, column=trace_col).value
-        time_column.append(time_val)
-        trace_column.append(trace_val)
-    
-    return image_column[:-11:-1], time_column[:-11:-1], trace_column[:-11:-1]
+human_time = []
+scene_time = []
+reason_time = []
 
-# vlm处理一个图片，输出对应的描述
-def process_vlm(model, processor, prompt, video_file, generate_kwargs):
-    inputs = processor(prompt, images=[video_file], edit_prompt=True, return_prompt=True)
+def inference_human(model, processor, prompt, video_file, generate_kwargs):
+    start_time = time.time()
+    try:
+        inputs = processor(prompt, video_file, edit_prompt=True, return_prompt=True)
+    except:
+        print('corrupted:', video_file)
+        return None
     if 'prompt' in inputs:
         inputs.pop('prompt')
     inputs = {k:v.to(model.device) for k,v in inputs.items() if v is not None}
@@ -76,129 +38,153 @@ def process_vlm(model, processor, prompt, video_file, generate_kwargs):
         **generate_kwargs,
     )
     output_text = processor.tokenizer.decode(outputs[0][inputs['input_ids'][0].shape[0]:], skip_special_tokens=True)
+    end_time = time.time()
+    print('完成人像处理，用时'+str(end_time-start_time)+'秒')
+    human_time.append(end_time-start_time)
     return output_text
 
-# llm的调用
-def process_llm(llm, llm_tokenizer, prompt):
-    messages = [{"role": "user", "content": prompt}]
-    text = llm_tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-    llm_inputs = llm_tokenizer([text], return_tensors="pt").to(llm.device)
-    generated_ids = llm.generate(
-        llm_inputs.input_ids,
-        max_new_tokens=512
-    )
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(llm_inputs.input_ids, generated_ids)
-    ]
-    output_text = llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+def inference_scene(model, video_file, kw, tokenizer):
+    cap = cv2.VideoCapture(video_file)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames * 3 // 4 - 1)
+    success, image = cap.read()
+    start_time = time.time()
+    image = Image.fromarray(image)
+    image = _transform(224)(image)
+    image = image.cuda(non_blocking=True)
+    kt = torch.tensor(tokenizer.encode(kw))
+    padding = 20 - kt.shape[0]
+    if padding > 0:
+        kt = torch.cat((kt, torch.zeros(padding, dtype=torch.int64) - 1))
+    elif padding < 0:
+        kt = kt[:20]
+    mask_kt = kt.ge(0)
+    kt[~mask_kt] = 0
+    kt = kt.cuda(non_blocking=True)
+    image = image.unsqueeze(0)
+    kt = kt.unsqueeze(0)
+    prefix, len_cls = model.image_encode(image)
+    prefix_embed = model.clip_project(prefix)
+    kt = model.gpt.transformer.wte(kt)
+    len_pre = model.len_head(len_cls)
+    prefix_embed = model.kw_att(prefix_embed, kt)
+    generated_text_prefix = generate2_adpt_if_nodist(model, tokenizer, embed=prefix_embed, len_pre=len_pre.argmax(-1) + 1)
+    end_time = time.time()
+    cap.release()
+    print('完成场景处理，用时'+str(end_time-start_time)+'秒')
+    scene_time.append(end_time-start_time)
+    return generated_text_prefix
+
+# def inference_llm(llm, llm_tokenizer, prompt):
+def inference_llm(llm, prompt):
+    start_time = time.time()
+    # messages = [{"role": "user", "content": prompt}]
+    # text = llm_tokenizer.apply_chat_template(
+    #     messages,
+    #     tokenize=False,
+    #     add_generation_prompt=True
+    # )
+    # llm_inputs = llm_tokenizer([text], return_tensors="pt").to(llm.device)
+    # generated_ids = llm.generate(
+    #     llm_inputs.input_ids,
+    #     max_new_tokens=128
+    # )
+    # generated_ids = [
+    #     output_ids[len(input_ids):] for input_ids, output_ids in zip(llm_inputs.input_ids, generated_ids)
+    # ]
+    # output_text = llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    sampling_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=128)
+    prompt = f"<|im_start|>system\n你是一个有帮助的助手。\n<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    outputs = llm.generate([prompt], sampling_params)
+    output_text = outputs[0].outputs[0].text
+    end_time = time.time()
+    print('完成推理，用时'+str(end_time-start_time)+'秒')
+    reason_time.append(end_time-start_time)
     return output_text
 
-# 组织llm的prompt
-def generate_prompt(images, times, traces):
-
-    # 检查三个列表的长度是否一致
-    if not (len(images) == len(times) == len(traces)):
-        raise ValueError("prompt的输入中，三个列表的长度必须一致！")
-
-    # 构造 prompt 的开头部分，说明任务要求
-    prompt_lines = [
-        "下面会提供针对一个人物A拍摄到的轨迹，请你用A代之这个人，要求进行详细分析和总结，并输出以下内容：",
-        "1. 整个轨迹中A的穿着和外貌；",
-        "2. 按时间顺序描述A的动作；",
-        "3. 按时间顺序描述A的移动轨迹；",
-        "4. 推断A在这个轨迹中的行为意图；",
-        "5. 总结A是否存在危险行为，或含有危险信息。"
-        "",
-        "下面是这个轨迹的各个节点的信息："
-    ]
-
-    # 按编号组织每张图片的信息
-    for idx, (img, t, loc) in enumerate(zip(images, times, traces), start=1):
-        prompt_lines.append(f"节点{idx}：")
-        prompt_lines.append(f"{img}")
-        prompt_lines.append(f"  时间：{t}")
-        prompt_lines.append(f"  地点：{loc}")
-        prompt_lines.append("")  # 添加空行分隔
-
-    # 拼接所有行，形成最终 prompt
-    prompt_lines.append("请基于上述信息进行详细分析和总结。")
-    prompt = "\n".join(prompt_lines)
-    return prompt
+def form_prompt(human_pred, scene_pred):
+    prompt = f"""请阅读以下英文文本，并从中总结出所描述人物的具体行为和意图：
+场景大致描述：{scene_pred}
+人物详细描述：{human_pred}    
+"""
+#     prompt = f"""请阅读以下的描述这个人的行为的文本：{human_pred}，请你判断出其中人物正在进行的意图是什么，请输出英文和中文，注意中文中不要出现中英文混杂。格式示例如下：
+# 中文意图：这个人的意图是XXXXXXX
+# 英文意图：The man's intention is to XXXXX."""
+    return prompt 
 
 
 def run():
-    # 输入参数
     import argparse
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name_or_path', type=str, help='Path to vlm, recommend PEAR')
-    parser.add_argument('--llm_path', type=str, help='Path to llm, recommand Qwen2.5')
-    parser.add_argument('--input_path', type=str, help='Path to trace file')
-    parser.add_argument('--sheet_name', type=str, default="Sheet1", help='Excel file sheet name')
-    parser.add_argument('--output_path', type=str, default="./debug.json", help='Path to save result, has to be a json file')
-    parser.add_argument("--max_samples", type=int, default=0, help="Limit sample num.")
-    parser.add_argument("--max_n_frames", type=int, default=8, help="Max number of frames to apply average sampling from the given video.")
-    parser.add_argument("--max_new_tokens", type=int, default=512, help="max number of generated tokens")
-    parser.add_argument("--top_p", type=float, default=1, help="Top_p sampling")
-    parser.add_argument("--temperature", type=float, default=0, help="Set temperature > 0 to enable sampling generation.")
+    parser.add_argument('--input_path', type=str, default="/nas/datasets/hmdb/", help='Path to video/image; or Dir to videos/images')
+    parser.add_argument("--max_samples", type=int, default=1, help="Limit sample num.")
+    parser.add_argument('--output_path', type=str, default="./dataset_hmdb.json", help='Path to save result, has to be a json file')
     args = parser.parse_args()
-
-    # 加载vlm
-    model, processor = load_model_and_processor(args.model_name_or_path, max_n_frames=args.max_n_frames, attn_implementation="flash_attention_2")
-    generate_kwargs = {
-        "do_sample": True if args.temperature > 0 else False,
-        "max_new_tokens": args.max_new_tokens,
-        "top_p": args.top_p,
-        "temperature": args.temperature,
-        "use_cache": True
-    }
-
-    # 检测输入与输出路径规范
+    # 查看路径
     assert os.path.exists(args.input_path), f"input_path not exist: {args.input_path}"
-    assert args.input_path.endswith('.xlsx'), f"invalid excel file name: {args.input_path}"
+    if os.path.isdir(args.input_path):
+        input_files = []
+        for mid_path in os.listdir(args.input_path):
+            full_path = os.path.join(args.input_path, mid_path)
+            input_file = [os.path.join(full_path, file) for file in os.listdir(full_path)]
+            if args.max_samples > 0:
+                # input_file = input_file[:args.max_samples]
+                input_file = sample(input_file, args.max_samples)
+            input_files.extend(input_file)
+        # input_files = [os.path.join(args.input_path, file) for file in os.listdir(args.input_path)]
+        # if args.max_samples > 0:
+        #     input_files = input_files[:args.max_samples]
+    else:
+        input_files = [args.input_path]
+    assert len(input_files) > 0, f"None valid input file in: {args.input_path} {VALID_DATA_FORMAT_STRING}"
     
     assert os.path.exists(os.path.dirname(args.output_path)), f"output_path not exist: {args.output_path}"
     assert args.output_path.endswith('.json'), f"invalid json file name: {args.output_path}"
-
-    # 处理输入
-    images, times, traces = process_input(args.input_path, args.sheet_name)
-
-    # 对每张图片生成画像
-    portraits = []
-    for image in tqdm(images, desc="生成画像中..."):
+    # 读取human模型
+    human_model, processor = load_model_and_processor('PEAR-7b', max_n_frames=8, attn_implementation="flash_attention_2")
+    generate_kwargs = {
+        "do_sample": False,
+        "max_new_tokens": 512,
+        "top_p": 1,
+        "temperature": 0,
+        "use_cache": True
+    }
+    # 读取scene模型
+    scene_model = CaptionModel(10, clip_length=10, prefix_size=512,
+                                 num_layers=8, mapping_type=MappingType.MLP, Timestep=20,
+                                 if_drop_rate=0.1)
+    scene_model.load_state_dict(torch.load('KCDN-small/ckpt.pt', map_location=torch.device('cpu'))["model"])
+    scene_model = scene_model.cuda()
+    scene_model.eval()
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    # 读取llm
+    llm_name = 'qwen1.5'
+    # llm_tokenizer = AutoTokenizer.from_pretrained(llm_name)
+    # llm = AutoModelForCausalLM.from_pretrained(llm_name, torch_dtype="auto", device_map='auto', attn_implementation="flash_attention_2")
+    llm = LLM(model=llm_name, trust_remote_code=True, dtype="bfloat16", gpu_memory_utilization=0.95, tensor_parallel_size=4)
+    # 分配
+    intent_data = []
+    for input_file in tqdm(input_files, desc="Generating..."):
+        visual_type = get_visual_type(input_file)
         prompt = " USER: Please describe:\n1. The person's appearance, wearing, and other important charateristic.\n2. The person's each action in order and the objects the person interacted with.\n3. The person's mood, feeling, emotion or intention if can be detected.</s> ASSISTANT: "
-        prompt = "<image>\n" + prompt.replace("<image>", "").replace("<video>", "")
-        pred = process_vlm(model, processor, prompt, image, generate_kwargs)
-        portrait = ""
-        if pred is not None:
-            parts = re.split(r'\.(?!\s)', pred)
-            portrait += '  外貌特点：'
-            portrait += parts[0]
-            portrait += '\n  行为动作：'
-            portrait += parts[1]
-            portrait += '\n  情感意图：'
-            portrait += parts[2]
-        portraits.append(portrait)
-
-    # 释放显存
-    model = model.cpu()
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # 加载llm
-    llm_name = args.llm_path
-    llm_tokenizer = AutoTokenizer.from_pretrained(llm_name)
-    llm = AutoModelForCausalLM.from_pretrained(llm_name, torch_dtype="auto", device_map="auto")
-
-    # 分析总结
-    prompt = generate_prompt(portraits, times, traces)
-    analysis = process_llm(llm, llm_tokenizer, prompt)
-    with open(args.output_path, "w", encoding="utf-8") as json_file:
-        json.dump({'提问':prompt, '总结':analysis}, json_file, ensure_ascii=False, indent=4)
+        if visual_type == 'video':
+            prompt = "<video>\n" + prompt.replace("<image>", "").replace("<video>", "")
+        else:
+            prompt = "<image>\n" + prompt.replace("<image>", "").replace("<video>", "")
+        keyword = "human"
+        human_pred = inference_human(human_model, processor, prompt, input_file, generate_kwargs)
+        scene_pred = inference_scene(scene_model, input_file, keyword, tokenizer)
+        # scene_pred = ''
+        prompt = form_prompt(human_pred, scene_pred)
+        # analysis = inference_llm(llm, llm_tokenizer, prompt)
+        analysis = inference_llm(llm, prompt)
+        intent_data.append({'video_path':input_file, 'human':human_pred, 'scene':scene_pred, 'analysis':analysis})
+    # with open(args.output_path, "w", encoding="utf-8") as json_file:
+    #     json.dump(intent_data, json_file, ensure_ascii=False, indent=4)
+    print(sum(human_time)/len(human_time))
+    print(sum(scene_time)/len(scene_time))
+    print(sum(reason_time)/len(reason_time))
 
 if __name__ == "__main__":
     run()
